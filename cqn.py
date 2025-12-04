@@ -500,6 +500,15 @@ class CQNAgent:
         ).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
+
+        try:
+            self.encoder = torch.compile(self.encoder)
+            self.critic = torch.compile(self.critic)
+            # self.critic2 = torch.compile(self.critic2)
+            print("✅ TwinCQNAgent: torch.compile enabled")
+        except Exception as e:
+            print(f"⚠️ TwinCQNAgent: torch.compile skipped: {e}")
+
         # optimizers
         self.encoder_opt = torch.optim.AdamW(
             self.encoder.parameters(), lr=lr, weight_decay=weight_decay
@@ -668,6 +677,531 @@ class CQNAgent:
         # update critic target
         utils.soft_update_params(
             self.critic, self.critic_target, self.critic_target_tau
+        )
+
+        return metrics
+
+############################################################
+# TwinCQNAgent: twin critics + ensemble targets + beam search
+# This leaves the original CQNAgent untouched.
+############################################################
+
+def project_categorical_distribution(
+    next_q_probs_a: torch.Tensor,
+    reward: torch.Tensor,
+    discount: torch.Tensor,
+    support: torch.Tensor,
+    v_min: float,
+    v_max: float,
+    delta_z: float,
+) -> torch.Tensor:
+    """
+    Rainbow-style categorical projection onto fixed support.
+
+    Args:
+        next_q_probs_a: [B, L, D, atoms] value distribution at (s_{t+1}, a*)
+        reward: [B, 1] rewards r_t
+        discount: [B, 1] discounts gamma_t
+        support: [atoms] tensor of z_k
+        v_min, v_max: scalar bounds of support
+        delta_z: spacing between support atoms
+
+    Returns:
+        m: [B, L, D, atoms] projected distribution at (s_t, a_t)
+    """
+    shape = next_q_probs_a.shape               # [B, L, D, atoms]
+    atoms = support.shape[0]
+
+    # Flatten (L, D) → [B*L*D, atoms]
+    next_q_probs_a = next_q_probs_a.view(-1, atoms)
+    batch_size = next_q_probs_a.shape[0]
+
+    B = reward.shape[0]
+    # Tz: [B, atoms]
+    Tz = reward + discount * support.unsqueeze(0)
+    Tz = Tz.clamp(min=v_min, max=v_max)
+
+    # Map Tz to support indices in [0, atoms-1]
+    b = (Tz - v_min) / delta_z
+    eps = 1e-6
+    b = b.clamp(min=0.0, max=atoms - 1 - eps)
+
+    lower = b.floor().to(torch.int64)
+    upper = b.ceil().to(torch.int64)
+
+    same = lower == upper
+    if same.any():
+        lower[same] = torch.clamp(lower[same] - 1, min=0)
+        upper[same] = torch.clamp(upper[same] + 1, max=atoms - 1)
+
+    # Repeat for each (L*D); multiplier = (B*L*D)/B
+    multiplier = batch_size // B
+    b = torch.repeat_interleave(b, multiplier, dim=0)
+    lower = torch.repeat_interleave(lower, multiplier, dim=0)
+    upper = torch.repeat_interleave(upper, multiplier, dim=0)
+
+    m = torch.zeros_like(next_q_probs_a)
+
+    offset = torch.linspace(
+        0,
+        (batch_size - 1) * atoms,
+        batch_size,
+        device=lower.device,
+        dtype=lower.dtype,
+    ).unsqueeze(1).expand(batch_size, atoms)
+
+    m.view(-1).index_add_(
+        0,
+        (lower + offset).view(-1),
+        (next_q_probs_a * (upper.float() - b)).view(-1),
+    )
+    m.view(-1).index_add_(
+        0,
+        (upper + offset).view(-1),
+        (next_q_probs_a * (b - lower.float())).view(-1),
+    )
+
+    m = m.view(*shape)  # [B, L, D, atoms]
+    return m
+
+
+############################################################
+# TwinCQNAgent: twin critics + ensemble targets (no beam)
+# BC is kept (no annealing), torch.compile enabled.
+############################################################
+
+class TwinCQNAgent:
+    """
+    Twin-critic CQN with ensemble targets.
+
+    - Two critics (critic1, critic2) with shared encoder.
+    - Target backup uses the ensemble-mean categorical distribution
+      from critic_target1 and critic_target2.
+    - Action selection uses the mean of the greedy actions from the
+      two target critics + truncated normal exploration.
+    - Behavior cloning (FOSD + optional margin) is applied with
+      the same bc_lambda / bc_margin as baseline CQN, averaged
+      across the two critics.
+    """
+
+    def __init__(
+        self,
+        rgb_obs_shape,
+        low_dim_obs_shape,
+        action_shape,
+        device,
+        lr,
+        feature_dim,
+        hidden_dim,
+        levels,
+        bins,
+        atoms,
+        v_min,
+        v_max,
+        bc_lambda,          # from config, no annealing
+        bc_margin,          # from config, no annealing
+        critic_lambda,
+        critic_target_tau,
+        weight_decay,
+        num_expl_steps,
+        update_every_steps,
+        stddev_schedule,
+        use_logger,
+    ):
+        self.device = device
+        self.critic_target_tau = critic_target_tau
+        self.update_every_steps = update_every_steps
+        self.use_logger = use_logger
+        self.num_expl_steps = num_expl_steps
+        self.stddev_schedule = stddev_schedule
+
+        # Use BC hyper-params from config (no annealing)
+        self.bc_lambda = bc_lambda
+        self.bc_margin = bc_margin
+        self.critic_lambda = critic_lambda
+
+        # Shared encoder
+        self.encoder = MultiViewCNNEncoder(rgb_obs_shape).to(device)
+        repr_dim = self.encoder.repr_dim
+        low_dim = low_dim_obs_shape[-1]
+
+        # Two online critics
+        self.critic1 = C2FCritic(
+            action_shape,
+            repr_dim,
+            low_dim,
+            feature_dim,
+            hidden_dim,
+            levels,
+            bins,
+            atoms,
+            v_min,
+            v_max,
+        ).to(device)
+
+        self.critic2 = C2FCritic(
+            action_shape,
+            repr_dim,
+            low_dim,
+            feature_dim,
+            hidden_dim,
+            levels,
+            bins,
+            atoms,
+            v_min,
+            v_max,
+        ).to(device)
+
+        # Target critics
+        self.critic_target1 = C2FCritic(
+            action_shape,
+            repr_dim,
+            low_dim,
+            feature_dim,
+            hidden_dim,
+            levels,
+            bins,
+            atoms,
+            v_min,
+            v_max,
+        ).to(device)
+
+        self.critic_target2 = C2FCritic(
+            action_shape,
+            repr_dim,
+            low_dim,
+            feature_dim,
+            hidden_dim,
+            levels,
+            bins,
+            atoms,
+            v_min,
+            v_max,
+        ).to(device)
+
+        self.critic_target1.load_state_dict(self.critic1.state_dict())
+        self.critic_target2.load_state_dict(self.critic2.state_dict())
+
+        # Cache discretization params locally
+        self._levels = levels
+        self._bins = bins
+        self._initial_low = self.critic1.initial_low
+        self._initial_high = self.critic1.initial_high
+
+        # torch.compile (encoder + online critics only)
+        try:
+            self.encoder = torch.compile(self.encoder)
+            self.critic1 = torch.compile(self.critic1)
+            self.critic2 = torch.compile(self.critic2)
+            print("✅ TwinCQNAgent: torch.compile enabled")
+        except Exception as e:
+            print(f"⚠️ TwinCQNAgent: torch.compile skipped: {e}")
+
+
+                # Optimizers
+        self.encoder_opt = torch.optim.AdamW(
+            self.encoder.parameters(), lr=lr, weight_decay=weight_decay
+        )
+        self.critic1_opt = torch.optim.AdamW(
+            self.critic1.parameters(), lr=lr, weight_decay=weight_decay
+        )
+        self.critic2_opt = torch.optim.AdamW(
+            self.critic2.parameters(), lr=lr, weight_decay=weight_decay
+        )
+
+
+        # Data augmentation
+        self.aug = RandomShiftsAug(pad=4)
+
+        self.train()
+        self.critic_target1.eval()
+        self.critic_target2.eval()
+
+        print(self.encoder)
+        print(self.critic1)
+        print(self.critic2)
+
+    def train(self, training: bool = True):
+        self.training = training
+        self.encoder.train(training)
+        self.critic1.train(training)
+        self.critic2.train(training)
+
+    def _encode_decode_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Encode and immediately decode to stay on the C2F grid."""
+        discrete = encode_action(
+            action,
+            self._initial_low,
+            self._initial_high,
+            self._levels,
+            self._bins,
+        )
+        cont = decode_action(
+            discrete,
+            self._initial_low,
+            self._initial_high,
+            self._levels,
+            self._bins,
+        )
+        return cont
+
+    def act(self, rgb_obs, low_dim_obs, step, eval_mode):
+        # To torch
+        rgb_obs = torch.as_tensor(rgb_obs, device=self.device).unsqueeze(0)
+        low_dim_obs = torch.as_tensor(low_dim_obs, device=self.device).unsqueeze(0)
+
+        # Encode image
+        rgb_obs = self.encoder(rgb_obs)
+
+        # Exploration stddev
+        stddev = utils.schedule(self.stddev_schedule, step)
+
+        # Ensemble greedy action from target critics
+        with torch.no_grad():
+            a1, _ = self.critic_target1.get_action(rgb_obs, low_dim_obs)
+            a2, _ = self.critic_target2.get_action(rgb_obs, low_dim_obs)
+            action = 0.5 * (a1 + a2)
+
+        # Gaussian exploration (same structure as baseline)
+        stddev = torch.ones_like(action) * stddev
+        dist = utils.TruncatedNormal(action, stddev)
+        if eval_mode:
+            action = dist.mean
+        else:
+            action = dist.sample(clip=None)
+            if step < self.num_expl_steps:
+                action.uniform_(-1.0, 1.0)
+
+        # Snap back to discretization grid
+        action = self._encode_decode_action(action)
+
+        return action.cpu().numpy()[0]
+
+    def update_critic(
+        self,
+        rgb_obs,
+        low_dim_obs,
+        action,
+        reward,
+        discount,
+        next_rgb_obs,
+        next_low_dim_obs,
+        demos,
+    ):
+        metrics = dict()
+
+        # --- Target computation with ensemble mean ---
+        with torch.no_grad():
+            # Ensemble greedy action at next state (leave this as-is)
+            next_a1, mets1 = self.critic_target1.get_action(
+                next_rgb_obs, next_low_dim_obs
+            )
+            next_a2, mets2 = self.critic_target2.get_action(
+                next_rgb_obs, next_low_dim_obs
+            )
+            next_action = 0.5 * (next_a1 + next_a2)
+
+            if self.use_logger:
+                for k, v in mets1.items():
+                    if k in mets2:
+                        metrics[f"ensemble_{k}"] = 0.5 * (v + mets2[k])
+                    else:
+                        metrics[f"critic1_{k}"] = v
+                for k, v in mets2.items():
+                    if k not in mets1:
+                        metrics[f"critic2_{k}"] = v
+
+            # Value distributions at (s_{t+1}, next_action)
+            _, next_q_probs_a1, _, _ = self.critic_target1(
+                next_rgb_obs, next_low_dim_obs, next_action
+            )
+            _, next_q_probs_a2, _, _ = self.critic_target2(
+                next_rgb_obs, next_low_dim_obs, next_action
+            )
+
+            # --- CLIPPED DOUBLE Q (twin-min) ---
+
+            # support: [atoms] → broadcast to [B, L, D, atoms]
+            support = self.critic_target1.support  # [atoms]
+            v_min = self.critic_target1.v_min
+            v_max = self.critic_target1.v_max
+            delta_z = self.critic_target1.delta_z
+
+            support_expanded = support.view(1, 1, 1, -1)
+            support_expanded = support_expanded.expand_as(next_q_probs_a1)
+
+            # Expected Q for each critic: [B, L, D]
+            q1 = (next_q_probs_a1 * support_expanded).sum(dim=-1)
+            q2 = (next_q_probs_a2 * support_expanded).sum(dim=-1)
+
+            # Per-element mask: True where critic2 is more conservative (smaller Q)
+            use2 = (q2 < q1).unsqueeze(-1)  # [B, L, D, 1]
+
+            # Select the more conservative distribution per (B,L,D)
+            next_q_probs_a = torch.where(use2, next_q_probs_a2, next_q_probs_a1)
+
+            if self.use_logger:
+                metrics["target_q1_mean"] = q1.mean().item()
+                metrics["target_q2_mean"] = q2.mean().item()
+                metrics["target_q_min_mean"] = torch.minimum(q1, q2).mean().item()
+
+            # Project onto fixed support (C51-style) using the selected distribution
+            target_q_probs_a = project_categorical_distribution(
+                next_q_probs_a,
+                reward,
+                discount,
+                support,
+                v_min,
+                v_max,
+                delta_z,
+            )
+
+
+        # --- Online critics: both fit to the same target distribution ---
+        q_probs1, q_probs_a1, _, log_q_probs_a1 = self.critic1(
+            rgb_obs, low_dim_obs, action
+        )
+        q_probs2, q_probs_a2, _, log_q_probs_a2 = self.critic2(
+            rgb_obs, low_dim_obs, action
+        )
+
+        # Cross-entropy loss for C51 for both critics
+        q_critic_loss1 = -torch.sum(target_q_probs_a * log_q_probs_a1, 3).mean()
+        q_critic_loss2 = -torch.sum(target_q_probs_a * log_q_probs_a2, 3).mean()
+        q_critic_loss = 0.5 * (q_critic_loss1 + q_critic_loss2)
+
+        critic_loss = self.critic_lambda * q_critic_loss
+
+        if self.use_logger:
+            metrics["q_critic_loss1"] = q_critic_loss1.item()
+            metrics["q_critic_loss2"] = q_critic_loss2.item()
+            metrics["q_critic_loss"] = q_critic_loss.item()
+
+        # --- BC losses (FOSD + optional margin), averaged over two critics ---
+        if self.bc_lambda > 0.0:
+            demos = demos.float().squeeze(1)  # [B,]
+            if self.use_logger:
+                metrics["ratio_of_demos"] = demos.mean().item()
+
+            if torch.sum(demos) > 0:
+
+                def bc_losses(q_probs, q_probs_a):
+                    # FOSD loss
+                    q_probs_cdf = torch.cumsum(q_probs, -1)
+                    q_probs_a_cdf = torch.cumsum(q_probs_a, -1)
+                    bc_fosd_loss = (
+                        (q_probs_a_cdf.unsqueeze(-2) - q_probs_cdf)
+                        .clamp(min=0)
+                        .sum(-1)
+                        .mean([-1, -2, -3])
+                    )
+                    bc_fosd_loss = (bc_fosd_loss * demos).sum() / demos.sum()
+
+                    margin_loss = torch.tensor(
+                        0.0, device=q_probs.device, dtype=q_probs.dtype
+                    )
+                    if self.bc_margin > 0:
+                        support = self.critic1.support
+                        qs = (q_probs * support.expand_as(q_probs)).sum(-1)
+                        qs_a = (
+                            q_probs_a
+                            * support.expand_as(q_probs_a)
+                        ).sum(-1)
+                        margin_loss = torch.clamp(
+                            self.bc_margin - (qs_a.unsqueeze(-1) - qs), min=0
+                        ).mean([-1, -2, -3])
+                        margin_loss = (margin_loss * demos).sum() / demos.sum()
+
+                    return bc_fosd_loss, margin_loss
+
+                fosd1, margin1 = bc_losses(q_probs1, q_probs_a1)
+                fosd2, margin2 = bc_losses(q_probs2, q_probs_a2)
+
+                bc_fosd_loss = 0.5 * (fosd1 + fosd2)
+                critic_loss = critic_loss + self.bc_lambda * bc_fosd_loss
+                if self.use_logger:
+                    metrics["bc_fosd_loss"] = bc_fosd_loss.item()
+
+                if self.bc_margin > 0:
+                    bc_margin_loss = 0.5 * (margin1 + margin2)
+                    critic_loss = critic_loss + self.bc_lambda * bc_margin_loss
+                    if self.use_logger:
+                        metrics["bc_margin_loss"] = bc_margin_loss.item()
+
+        # Optimize encoder and both critics
+        self.encoder_opt.zero_grad(set_to_none=True)
+        self.critic1_opt.zero_grad(set_to_none=True)
+        self.critic2_opt.zero_grad(set_to_none=True)
+
+        critic_loss.backward()
+
+        self.critic1_opt.step()
+        self.critic2_opt.step()
+        self.encoder_opt.step()
+
+
+        return metrics
+
+    def update(self, replay_iter, step):
+        """
+        Full update step, mirroring baseline CQNAgent.update
+        but using twin critics and twin targets.
+        """
+        metrics = dict()
+
+        if step % self.update_every_steps != 0:
+            return metrics
+
+        batch = next(replay_iter)
+        (
+            rgb_obs,
+            low_dim_obs,
+            action,
+            reward,
+            discount,
+            next_rgb_obs,
+            next_low_dim_obs,
+            demos,
+        ) = utils.to_torch(batch, self.device)
+
+        # augment
+        rgb_obs = rgb_obs.float()
+        next_rgb_obs = next_rgb_obs.float()
+        rgb_obs = torch.stack(
+            [self.aug(rgb_obs[:, v]) for v in range(rgb_obs.shape[1])], 1
+        )
+        next_rgb_obs = torch.stack(
+            [self.aug(next_rgb_obs[:, v]) for v in range(next_rgb_obs.shape[1])], 1
+        )
+
+        # encode
+        rgb_obs = self.encoder(rgb_obs)
+        with torch.no_grad():
+            next_rgb_obs = self.encoder(next_rgb_obs)
+
+        if self.use_logger:
+            metrics["batch_reward"] = reward.mean().item()
+
+        # update critics
+        metrics.update(
+            self.update_critic(
+                rgb_obs,
+                low_dim_obs,
+                action,
+                reward,
+                discount,
+                next_rgb_obs,
+                next_low_dim_obs,
+                demos,
+            )
+        )
+
+        # update target critics
+        utils.soft_update_params(
+            self.critic1, self.critic_target1, self.critic_target_tau
+        )
+        utils.soft_update_params(
+            self.critic2, self.critic_target2, self.critic_target_tau
         )
 
         return metrics

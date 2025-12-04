@@ -2,5 +2,5 @@ defaults:
   - default
   - _self_
 
-task_name: meat_on_gril
+task_name: meat_on_grill
 episode_length: 150

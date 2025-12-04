@@ -233,6 +233,8 @@ class RLBench:
             frame = np.clip((frame * 255.0).astype(np.uint8), 0, 255)
             return frame
 
+
+    
     def get_demos(self, num_demos):
         """
         1. Collect or fetch demonstrations
@@ -243,18 +245,48 @@ class RLBench:
         if live_demos:
             logging.warning("Live demo collection.. Takes a while..")
         raw_demos = self.task.get_demos(num_demos, live_demos)
+
         demos = []
-        for raw_demo in raw_demos:
-            demo = self.convert_demo_to_timesteps(raw_demo)
+        skipped_indices = []
+
+        for demo_idx, raw_demo in enumerate(raw_demos):
+            demo = self.convert_demo_to_timesteps(raw_demo, demo_idx=demo_idx)
             if demo is not None:
                 demos.append(demo)
             else:
-                print("Skipping demo for large delta action")
+                # convert_demo_to_timesteps already printed reason
+                skipped_indices.append(demo_idx)
+
+        print(
+            f"[RLBench] get_demos: requested {num_demos}, "
+            f"received {len(raw_demos)} from task, "
+            f"kept {len(demos)}, skipped {len(skipped_indices)} demos "
+            f"with indices {skipped_indices}"
+        )
+
         # override action stats with demonstration-based stats
         self._action_stats = self.extract_action_stats(demos)
         # rescale actions with action stats
         demos = [self.rescale_demo_actions(demo) for demo in demos]
+
+        TARGET_VALID = 100  # or make it a config param
+
+        if len(demos) < TARGET_VALID:
+            print(
+                f"[RLBench] WARNING: only {len(demos)} valid demos after filtering, "
+                f"which is less than TARGET_VALID={TARGET_VALID}"
+            )
+        else:
+            if len(demos) > TARGET_VALID:
+                print(
+                    f"[RLBench] Truncating demos from {len(demos)} to {TARGET_VALID} "
+                    f"to match paper setup."
+                )
+            demos = demos[:TARGET_VALID]
+
+
         return demos
+
 
     def extract_action_stats(self, demos: list[list[ExtendedTimeStep]]):
         actions = []
@@ -285,7 +317,8 @@ class RLBench:
         ).astype(np.float32)
         return action
 
-    def convert_demo_to_timesteps(self, demo):
+
+    def convert_demo_to_timesteps(self, demo, demo_idx=None):
         timesteps = []
 
         # Clear deques used for frame stacking
@@ -306,8 +339,19 @@ class RLBench:
             else:
                 prev_rlb_obs = demo[i - 1]
                 action = self.extract_delta_joint_action(prev_rlb_obs, rlb_obs)
+
+                # skip demos with too large joint deltas
                 if np.any(action[:-1] > 0.2) or np.any(action[:-1] < -0.2):
+                    if demo_idx is not None:
+                        print(
+                            f"Skipping demo {demo_idx} for large delta action at "
+                            f"step {i} (max={action[:-1].max():.3f}, "
+                            f"min={action[:-1].min():.3f})"
+                        )
+                    else:
+                        print("Skipping demo for large delta action")
                     return None
+
                 if i == len(demo) - 1:
                     step_type = StepType.LAST
                     reward = 1.0
@@ -327,6 +371,7 @@ class RLBench:
             timesteps.append(timestep)
 
         return timesteps
+
 
     def rescale_demo_actions(
         self, demo: list[ExtendedTimeStep]
