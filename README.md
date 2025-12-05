@@ -122,6 +122,9 @@ cd RLBench/rlbench
 
 #collect extra demos in case filtered by velocity limits. The real number of demos used is 100 as hardcoded in rlbench_env.py
 CUDA_VISIBLE_DEVICES=0 python dataset_generator.py   --save_path="${DEMO_ROOT}"   --image_size 84 84   --renderer opengl3   --episodes_per_task 120   --variations 1   --processes 1   --tasks take_lid_off_saucepan   --arm_max_velocity=2.0   --arm_max_acceleration=8.0
+
+# Go back to Twin-CQN repo root
+cd ../..
 ```
 
 In this fork, the same demo dataset can be used for both the baseline CQN agent and the Twin-CQN agent.
@@ -133,7 +136,7 @@ In this fork, the same demo dataset can be used for both the baseline CQN agent 
 To run RLBench experiments with the original CQN agent:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 Dpython train_rlbench.py   rlbench_task=take_lid_off_saucepan   num_demos=120   dataset_root="${DEMO_ROOT}"   agent._target_=cqn.CQNAgent
+CUDA_VISIBLE_DEVICES=0 python train_rlbench.py   rlbench_task=take_lid_off_saucepan   num_demos=120   dataset_root="${DEMO_ROOT}"   agent._target_=cqn.CQNAgent
 ```
 
 Notes:

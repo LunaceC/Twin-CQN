@@ -8,7 +8,7 @@ export TARGET_POLICY_SMOOTHING=0
 
 # Root directory where your RLBench demos are stored.
 # CHANGE THIS to your actual path before running.
-DATA_ROOT=/path/to/rlbench_cqn
+DATA_ROOT=/home/your_name/Twin-CQN/rlbench_demos
 
 # Optional: Weights & Biases configuration.
 # Uncomment and set these if you want to enable wandb logging.
