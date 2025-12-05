@@ -62,10 +62,19 @@ At a high level:
 
 Create and activate the conda environment:
 
+
 ```bash
 conda env create -f conda_env.yml
 conda activate cqn
 ```
+
+    # IMPORTANT: Install torch/torchvision AFTER creating the env,
+    # using the official command from https://pytorch.org/get-started/locally/
+    # so that you get a wheel that supports your specific GPU (e.g. RTX 50-series).
+    #
+    # Example (you must adapt cuXXX according to PyTorch's website):
+    #   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cuXXX
+
 
 ### 2.2 RLBench and PyRep installation
 
@@ -84,7 +93,12 @@ pip install .
 cd ../RLBench
 git checkout b80e51feb3694d9959cb8c0408cd385001b01382
 pip install .
+
+# Go back to Twin-CQN repo root
+cd ..
 ```
+
+
 
 Refer to the RLBench and Robobase READMEs for additional details:
 
@@ -100,9 +114,14 @@ Refer to the RLBench and Robobase READMEs for additional details:
 Before training, collect demonstrations for the target tasks using RLBench’s `dataset_generator.py`. Example (for one task):
 
 ```bash
+# From Twin-CQN repository root
+mkdir -p rlbench_demos
+export DEMO_ROOT="$(pwd)/rlbench_demos"
+
 cd RLBench/rlbench
 
-CUDA_VISIBLE_DEVICES=0 DISPLAY=:0.0 python dataset_generator.py   --save_path=/your/own/directory   --image_size 84 84   --renderer opengl3   --episodes_per_task 100   --variations 1   --processes 1   --tasks take_lid_off_saucepan   --arm_max_velocity=2.0   --arm_max_acceleration=8.0
+#collect extra demos in case filtered by velocity limits. The real number of demos used is 100 as hardcoded in rlbench_env.py
+CUDA_VISIBLE_DEVICES=0 python dataset_generator.py   --save_path="${DEMO_ROOT}"   --image_size 84 84   --renderer opengl3   --episodes_per_task 120   --variations 1   --processes 1   --tasks take_lid_off_saucepan   --arm_max_velocity=2.0   --arm_max_acceleration=8.0
 ```
 
 In this fork, the same demo dataset can be used for both the baseline CQN agent and the Twin-CQN agent.
@@ -114,31 +133,26 @@ In this fork, the same demo dataset can be used for both the baseline CQN agent 
 To run RLBench experiments with the original CQN agent:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 DISPLAY=:0.0 python train_rlbench.py   rlbench_task=take_lid_off_saucepan   num_demos=100   dataset_root=/your/own/directory   agent._target_=cqn.CQNAgent
+CUDA_VISIBLE_DEVICES=0 Dpython train_rlbench.py   rlbench_task=take_lid_off_saucepan   num_demos=120   dataset_root="${DEMO_ROOT}"   agent._target_=cqn.CQNAgent
 ```
 
 Notes:
 
 - `rlbench_task` should match the RLBench task name used when generating demos.
-- `dataset_root` points to the directory passed as `--save_path` to `dataset_generator.py`.
 - `agent._target_` selects the agent class used by Hydra. `cqn.CQNAgent` is the original baseline from the CQN paper.
 
 ---
 
 ### 3.3 Twin-CQN agent (this fork)
 
-The Twin-CQN variant uses two critics and a pessimistic target:
-
-\[
-y = r + \gamma \cdot \min(Q_{\theta_1^-}(s', a'), Q_{\theta_2^-}(s', a')).
-\]
+The Twin-CQN variant uses two critics and a pessimistic target.
 
 All other training details (encoder architecture, auxiliary BC loss, demonstrations, and training budget) are kept consistent with the baseline CQN setup for fair comparison.
 
 To run RLBench experiments with the Twin-CQN agent:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 DISPLAY=:0.0 python train_rlbench.py   rlbench_task=take_lid_off_saucepan   num_demos=120   dataset_root=/your/own/directory   agent._target_=cqn.TwinCQNAgent
+CUDA_VISIBLE_DEVICES=0  python train_rlbench.py   rlbench_task=take_lid_off_saucepan   num_demos=120   dataset_root="${DEMO_ROOT}"    agent._target_=cqn.TwinCQNAgent
 ```
 
 You can substitute any supported RLBench task (e.g., `open_door`, `turn_on_lightbulb`, `open_oven`, `take_lid_off_saucepan`, `press_switch`, `turn_tap`) as long as you have corresponding demonstrations under `dataset_root`.
@@ -164,27 +178,6 @@ Key points:
 
 ---
 
-### 3.5 Example script: baseline vs Twin-CQN (test script)
-
-This fork includes a small helper script under `scripts/` to demonstrate and test both agents on a single RLBench task:
-
-```bash
-bash scripts/run_examples.sh
-```
-
-Before running:
-
-1. Edit `DATA_ROOT` inside the script to point to your RLBench demos.
-2. Optionally uncomment and configure the Weights & Biases (wandb) environment variables if you wish to log runs.
-
-The script will:
-
-- Launch one baseline `CQNAgent` run.
-- Launch one `TwinCQNAgent` run with the same task and demo root.
-
-This serves as a quick smoke test that both agents and the environment wiring (including demo filtering) are working.
-
----
 
 ## 4. DMC experiments
 
@@ -208,11 +201,12 @@ If desired, you can enable Weights & Biases logging:
 2. Pass overrides on the command line, for example:
 
    ```bash
-   python train_rlbench.py      rlbench_task=open_oven      num_demos=100      dataset_root=/your/own/directory      agent._target_=cqn.TwinCQNAgent      wandb.project=Twin-CQN_RLBench      wandb.entity=your_wandb_entity
+   python train_rlbench.py      rlbench_task=open_oven      num_demos=120      dataset_root="${DEMO_ROOT}"      agent._target_=cqn.TwinCQNAgent      wandb.project=Twin-CQN_RLBench      wandb.entity=your_wandb_entity
    ```
 
 By default, the repo is configured so that logging can be turned on or off without changing the core training code.
 
+There is pre-conditioned tensorboard integration that could be turned on in config_rlbench.yaml
 ---
 
 ## 6. Acknowledgements
