@@ -1,0 +1,5 @@
+PyRep/
+RLBench/
+exp_local/
+rlbench_demos/
+__pycache__/
